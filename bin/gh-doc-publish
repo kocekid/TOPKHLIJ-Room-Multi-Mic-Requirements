@@ -233,12 +233,12 @@ def safe_remove(path: Path):
         path.unlink()
 
 
-def verify_inputs(doc: Path, assets: Path):
+def verify_inputs(doc: Path, assets: Path | None = None):
     if not doc.exists() or not doc.is_file():
         raise RuntimeError(f"文档不存在: {doc}")
     if doc.suffix.lower() != ".md":
         raise RuntimeError(f"文档不是 .md: {doc}")
-    if not assets.exists() or not assets.is_dir():
+    if assets is not None and (not assets.exists() or not assets.is_dir()):
         raise RuntimeError(f"原型图目录不存在: {assets}")
 
 
@@ -281,6 +281,40 @@ def rewrite_markdown_asset_refs(text: str, source_doc: Path, source_assets: Path
     return text
 
 
+def normalize_markdown_refs_for_repo_asset_dir(text: str, asset_dir_name: str | None) -> str:
+    asset_dir_name = (asset_dir_name or '').strip()
+    if not asset_dir_name:
+        return text
+
+    def map_ref(ref: str) -> str:
+        ref = ref.strip()
+        if not ref or re.match(r'^(https?:)?//|data:|#', ref):
+            return ref
+        m = re.match(r'^(?P<path>[^?#]+)(?P<suffix>[?#].*)?$', ref)
+        if not m:
+            return ref
+        path_part = m.group('path').replace('\\', '/').strip()
+        suffix = m.group('suffix') or ''
+        parts = [part for part in path_part.split('/') if part not in ('', '.')]
+        while parts and parts[0] == '..':
+            parts.pop(0)
+        if not parts or parts[0] != asset_dir_name:
+            return ref
+        return '/'.join(parts) + suffix
+
+    text = re.sub(
+        r'(!\[[^\]]*\]\()([^)]+)(\))',
+        lambda m: f"{m.group(1)}{map_ref(m.group(2))}{m.group(3)}",
+        text,
+    )
+    text = re.sub(
+        r'(<img[^>]+src=["\'])([^"\']+)(["\'])',
+        lambda m: f"{m.group(1)}{map_ref(m.group(2))}{m.group(3)}",
+        text,
+    )
+    return text
+
+
 def merge_gitignore(repo_dir: Path):
     existing = []
     p = repo_dir / '.gitignore'
@@ -295,7 +329,7 @@ def merge_gitignore(repo_dir: Path):
     p.write_text("\n".join(merged).rstrip("\n") + "\n", encoding='utf-8')
 
 
-def sync_scope(repo_dir: Path, doc: Path, assets: Path, owner: str, repo: str):
+def sync_scope(repo_dir: Path, doc: Path, assets: Path | None, owner: str, repo: str):
     manifest = load_manifest(owner, repo)
     previous = manifest.get("managed", {})
     prev_doc = previous.get("doc_name")
@@ -303,15 +337,25 @@ def sync_scope(repo_dir: Path, doc: Path, assets: Path, owner: str, repo: str):
 
     if prev_doc and prev_doc != doc.name:
         safe_remove(repo_dir / prev_doc)
-    if prev_assets and prev_assets != assets.name:
-        safe_remove(repo_dir / prev_assets)
 
     target_doc = repo_dir / doc.name
-    target_assets = repo_dir / assets.name
-    safe_remove(target_assets)
-    shutil.copytree(assets, target_assets, ignore=shutil.ignore_patterns('.DS_Store'))
+    target_assets = None
     doc_text = doc.read_text(encoding='utf-8')
-    rewritten_doc = rewrite_markdown_asset_refs(doc_text, doc, assets, target_doc, target_assets)
+
+    if assets is not None:
+        if prev_assets and prev_assets != assets.name:
+            safe_remove(repo_dir / prev_assets)
+        target_assets = repo_dir / assets.name
+        safe_remove(target_assets)
+        shutil.copytree(assets, target_assets, ignore=shutil.ignore_patterns('.DS_Store'))
+        rewritten_doc = rewrite_markdown_asset_refs(doc_text, doc, assets, target_doc, target_assets)
+        asset_dir_name = assets.name
+    else:
+        if prev_assets:
+            target_assets = repo_dir / prev_assets
+        rewritten_doc = normalize_markdown_refs_for_repo_asset_dir(doc_text, prev_assets)
+        asset_dir_name = prev_assets or ''
+
     target_doc.write_text(rewritten_doc, encoding='utf-8')
     merge_gitignore(repo_dir)
 
@@ -320,7 +364,7 @@ def sync_scope(repo_dir: Path, doc: Path, assets: Path, owner: str, repo: str):
         "repo": repo,
         "managed": {
             "doc_name": doc.name,
-            "asset_dir_name": assets.name,
+            "asset_dir_name": asset_dir_name,
         }
     })
     return target_doc, target_assets
@@ -417,7 +461,7 @@ def cmd_auth_delete(args):
 
 def cmd_publish(args):
     doc = Path(args.doc).expanduser().resolve()
-    assets = Path(args.assets).expanduser().resolve()
+    assets = Path(args.assets).expanduser().resolve() if args.assets else None
     verify_inputs(doc, assets)
 
     token, token_source = resolve_token(args.token)
@@ -426,6 +470,8 @@ def cmd_publish(args):
     visibility_private = not args.public
     repo_action, _repo_meta = ensure_repo(owner, repo, token, private=visibility_private, description=args.description)
     branch = (_repo_meta or {}).get("default_branch") or "main"
+    if assets is None and repo_action != 'exists':
+        raise RuntimeError('新建仓库时原型图目录不能为空；仅更新已有仓库时才可不传')
     repo_dir = ensure_clone(owner, repo, token, branch=branch)
     target_doc, _target_assets = sync_scope(repo_dir, doc, assets, owner, repo)
     refs, missing = verify_markdown_assets(repo_dir, target_doc)
@@ -440,7 +486,7 @@ def cmd_publish(args):
         "repo_action": repo_action,
         "token_source": token_source,
         "doc": str(doc),
-        "assets": str(assets),
+        "assets": str(assets) if assets else '',
         "image_ref_count": len(refs),
         "missing_image_ref_count": len(missing),
         "changed_files": commit_result["changed"],
@@ -475,7 +521,7 @@ def build_parser():
     pub = sub.add_parser("publish", help="发布或更新一个文档仓库")
     pub.add_argument("repo", help="GitHub 仓库名，比如 BD2.0")
     pub.add_argument("doc", help="Markdown 文档路径")
-    pub.add_argument("assets", help="原型图目录路径")
+    pub.add_argument("assets", nargs='?', help="原型图目录路径；更新已有仓库时可不传")
     pub.add_argument("--owner", help=f"仓库 owner，默认自动探测，兜底 {DEFAULT_OWNER}")
     pub.add_argument("--token", help="本次命令使用的 GitHub token")
     pub.add_argument("--public", action="store_true", help="仓库不存在时，按公开仓库创建；默认私有")

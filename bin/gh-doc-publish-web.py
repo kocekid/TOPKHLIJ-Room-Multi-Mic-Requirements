@@ -452,7 +452,7 @@ INDEX_HTML = r'''<!doctype html>
 
         <div style="height:12px"></div>
         <div class="footer-note">
-          文档和原型图会先发到本机这个页面背后的本地服务，再由本地服务调用你已经做好的 gh-doc-publish 工具去同步 GitHub。认证优先读 macOS Keychain 里的 token。
+          文档会先发到本机这个页面背后的本地服务，再由本地服务调用你已经做好的 gh-doc-publish 工具去同步 GitHub。更新已有仓库时，原型图目录可不重传，默认沿用仓库里现有目录。认证优先读 macOS Keychain 里的 token。
         </div>
 
         <input id="docFallback" type="file" accept=".md,text/markdown" hidden />
@@ -464,7 +464,7 @@ INDEX_HTML = r'''<!doctype html>
         <div class="summary-list">
           <div class="summary-card">
             <strong>上传习惯</strong>
-            <small>只同步你指定的一个 md 和一个原型图目录，避免把整个项目目录一锅端上传。</small>
+            <small>只同步你指定的一个 md，原型图目录按需同步；更新已有仓库时可沿用现有原型图目录，避免把整个项目目录一锅端上传。</small>
           </div>
           <div class="summary-card">
             <strong>校验逻辑</strong>
@@ -557,6 +557,7 @@ INDEX_HTML = r'''<!doctype html>
         repoInput.placeholder = '比如：BD2.0';
         ownerInput.placeholder = '默认自动探测';
       }
+      renderAssetsMeta();
     }
 
     function renderRepoOptions() {
@@ -684,7 +685,8 @@ INDEX_HTML = r'''<!doctype html>
 
     function renderAssetsMeta() {
       if (!state.assetsFiles.length) {
-        assetsMeta.innerHTML = '<div class="meta-row"><span class="meta-label">当前目录</span><span>还没选</span></div>';
+        const optionalText = state.mode === 'update' ? '还没选（更新模式可留空，沿用仓库现有原型图目录）' : '还没选';
+        assetsMeta.innerHTML = `<div class="meta-row"><span class="meta-label">当前目录</span><span>${escapeHtml(optionalText)}</span></div>`;
         return;
       }
       const preview = state.assetsFiles.slice(0, 4).map(item => `<div class="mono">${escapeHtml(item.relativePath)}</div>`).join('');
@@ -823,7 +825,7 @@ INDEX_HTML = r'''<!doctype html>
         setResult('你还没选 Markdown 文档。', false);
         return;
       }
-      if (!state.assetsFiles.length) {
+      if (!state.assetsFiles.length && !isUpdateMode) {
         setResult('你还没选原型图目录。', false);
         return;
       }
@@ -1270,6 +1272,7 @@ def publish_from_payload(payload: dict):
     doc_base64 = doc.get("content_base64")
     dir_name = str(assets.get("dir_name", "")).strip() or "原型图"
     asset_files = assets.get("files") or []
+    has_assets = bool(asset_files)
 
     if mode == 'update' and selected_repo:
         if '/' not in selected_repo:
@@ -1284,7 +1287,7 @@ def publish_from_payload(payload: dict):
         raise RuntimeError("文档必须是 .md")
     if not doc_base64:
         raise RuntimeError("文档内容为空")
-    if not asset_files:
+    if not has_assets and mode != 'update':
         raise RuntimeError("原型图目录为空")
 
     with tempfile.TemporaryDirectory(prefix="gh-doc-publish-web-") as tmp:
@@ -1293,19 +1296,22 @@ def publish_from_payload(payload: dict):
         asset_root = root / dir_name
         decode_b64_to_file(doc_base64, doc_path)
 
-        for item in asset_files:
-            rel = str(item.get("relative_path", "")).strip().lstrip("/")
-            blob = item.get("content_base64")
-            if not rel or not blob:
-                raise RuntimeError("原型图目录里有无效文件项")
-            target = (asset_root / rel).resolve()
-            if asset_root.resolve() not in target.parents and target != asset_root.resolve():
-                raise RuntimeError(f"非法相对路径: {rel}")
-            decode_b64_to_file(blob, target)
+        if has_assets:
+            for item in asset_files:
+                rel = str(item.get("relative_path", "")).strip().lstrip("/")
+                blob = item.get("content_base64")
+                if not rel or not blob:
+                    raise RuntimeError("原型图目录里有无效文件项")
+                target = (asset_root / rel).resolve()
+                if asset_root.resolve() not in target.parents and target != asset_root.resolve():
+                    raise RuntimeError(f"非法相对路径: {rel}")
+                decode_b64_to_file(blob, target)
 
-        normalize_uploaded_markdown_refs(doc_path, dir_name)
+            normalize_uploaded_markdown_refs(doc_path, dir_name)
 
-        cmd = [TOOL_PATH, "publish", repo, str(doc_path), str(asset_root)]
+        cmd = [TOOL_PATH, "publish", repo, str(doc_path)]
+        if has_assets:
+            cmd.append(str(asset_root))
         if owner:
             cmd += ["--owner", owner]
         if description:
