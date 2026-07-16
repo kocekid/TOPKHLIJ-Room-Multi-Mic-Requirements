@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SERVICE_NAME = "gh-doc-publish"
+DEFAULT_OWNER = "kocekid"
+CACHE_ROOT = Path.home() / "Library" / "Caches" / SERVICE_NAME
+MANIFEST_ROOT = CACHE_ROOT / "manifests"
+GITIGNORE_LINES = [".DS_Store", "*.bak", "*_backup*"]
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def run(cmd, cwd=None, capture=True, check=True, extra_env=None):
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        capture_output=capture,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({proc.returncode}): {' '.join(cmd)}\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def git_auth_header(token: str) -> str:
+    encoded = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    return f"AUTHORIZATION: basic {encoded}"
+
+
+def git(cmd, repo_dir=None, token=None, check=True):
+    full = ["git"]
+    if token:
+        full += ["-c", "credential.helper=", "-c", f"http.extraheader={git_auth_header(token)}"]
+    full += cmd
+    return run(full, cwd=repo_dir, check=check)
+
+
+def api_request(method: str, url: str, token: str, data=None):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": SERVICE_NAME,
+    }
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = resp.read().decode("utf-8")
+            return resp.status, json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as e:
+        payload = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(payload) if payload else {}
+        except Exception:
+            parsed = {"message": payload}
+        return e.code, parsed
+
+
+def keychain_get():
+    proc = subprocess.run(
+        ["security", "find-generic-password", "-a", "default", "-s", SERVICE_NAME, "-w"],
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    return None
+
+
+def keychain_set(token: str):
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", "default", "-s", SERVICE_NAME],
+        text=True,
+        capture_output=True,
+    )
+    proc = subprocess.run(
+        ["security", "add-generic-password", "-a", "default", "-s", SERVICE_NAME, "-w", token, "-U"],
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr or proc.stdout or "failed to save token to Keychain")
+
+
+def keychain_delete():
+    proc = subprocess.run(
+        ["security", "delete-generic-password", "-a", "default", "-s", SERVICE_NAME],
+        text=True,
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
+def gh_token():
+    status = subprocess.run(["gh", "auth", "status", "-h", "github.com"], text=True, capture_output=True)
+    if status.returncode != 0:
+        return None
+    proc = subprocess.run(["gh", "auth", "token"], text=True, capture_output=True)
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    return None
+
+
+def resolve_token(explicit_token=None):
+    if explicit_token:
+        return explicit_token, "--token"
+    env_token = os.environ.get("GITHUB_TOKEN")
+    if env_token:
+        return env_token, "GITHUB_TOKEN"
+    kc = keychain_get()
+    if kc:
+        return kc, "macOS Keychain"
+    gh = gh_token()
+    if gh:
+        return gh, "gh auth"
+    raise RuntimeError(
+        "找不到 GitHub token。用法：\n"
+        "1) 先执行 gh-doc-publish auth set\n"
+        "2) 或本次命令前加 GITHUB_TOKEN=你的token\n"
+        "3) 或传 --token 你的token"
+    )
+
+
+def detect_owner(token, requested_owner=None):
+    if requested_owner:
+        return requested_owner
+    status, data = api_request("GET", "https://api.github.com/user", token)
+    if status == 200 and data.get("login"):
+        return data["login"]
+    return DEFAULT_OWNER
+
+
+def ensure_repo(owner, repo, token, private=True, description=None):
+    repo_url = f"https://api.github.com/repos/{owner}/{repo}"
+    status, data = api_request("GET", repo_url, token)
+    if status == 200:
+        return "exists", data
+    if status != 404:
+        raise RuntimeError(f"检查仓库失败: {data}")
+
+    payload = {
+        "name": repo,
+        "private": private,
+        "description": description or f"{repo} 需求文档与原型图",
+    }
+    create_url = "https://api.github.com/user/repos"
+    if owner != detect_owner(token, None):
+        create_url = f"https://api.github.com/orgs/{owner}/repos"
+    c_status, c_data = api_request("POST", create_url, token, payload)
+    if c_status not in (200, 201):
+        raise RuntimeError(f"创建仓库失败: {c_data}")
+    return "created", c_data
+
+
+def ensure_clone(owner, repo, token, branch="main"):
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    repo_dir = CACHE_ROOT / f"{owner}__{repo}"
+    remote = f"https://github.com/{owner}/{repo}.git"
+    remote_ref = f"refs/heads/{branch}"
+    if (repo_dir / ".git").exists():
+        git(["remote", "set-url", "origin", remote], repo_dir=repo_dir, token=token)
+        remote_branch = git(["ls-remote", "--heads", "origin", remote_ref], repo_dir=repo_dir, token=token, check=False).stdout.strip()
+        if remote_branch:
+            git(["fetch", "origin", f"{remote_ref}:refs/remotes/origin/{branch}"], repo_dir=repo_dir, token=token)
+            git(["checkout", "-B", branch, f"origin/{branch}"], repo_dir=repo_dir, token=token)
+            git(["reset", "--hard", f"origin/{branch}"], repo_dir=repo_dir, token=token)
+        else:
+            current_branch = git(["symbolic-ref", "--short", "HEAD"], repo_dir=repo_dir, token=token, check=False).stdout.strip()
+            if current_branch and current_branch != branch:
+                git(["checkout", "--orphan", branch], repo_dir=repo_dir, token=token, check=False)
+        git(["clean", "-fd"], repo_dir=repo_dir, token=token)
+    else:
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        git(["clone", "--depth", "1", remote, str(repo_dir)], token=token)
+        remote_branch = git(["ls-remote", "--heads", "origin", remote_ref], repo_dir=repo_dir, token=token, check=False).stdout.strip()
+        if not remote_branch:
+            current_branch = git(["symbolic-ref", "--short", "HEAD"], repo_dir=repo_dir, token=token, check=False).stdout.strip()
+            if current_branch and current_branch != branch:
+                git(["checkout", "--orphan", branch], repo_dir=repo_dir, token=token, check=False)
+    return repo_dir
+
+
+def manifest_path(owner: str, repo: str) -> Path:
+    MANIFEST_ROOT.mkdir(parents=True, exist_ok=True)
+    return MANIFEST_ROOT / f"{owner}__{repo}.json"
+
+
+def load_manifest(owner: str, repo: str):
+    p = manifest_path(owner, repo)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_manifest(owner: str, repo: str, payload: dict):
+    manifest_path(owner, repo).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def safe_remove(path: Path):
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def verify_inputs(doc: Path, assets: Path):
+    if not doc.exists() or not doc.is_file():
+        raise RuntimeError(f"文档不存在: {doc}")
+    if doc.suffix.lower() != ".md":
+        raise RuntimeError(f"文档不是 .md: {doc}")
+    if not assets.exists() or not assets.is_dir():
+        raise RuntimeError(f"原型图目录不存在: {assets}")
+
+
+def rewrite_markdown_asset_refs(text: str, source_doc: Path, source_assets: Path, target_doc: Path, target_assets: Path) -> str:
+    source_doc_parent = source_doc.parent.resolve()
+    source_assets_root = source_assets.resolve()
+
+    def map_ref(ref: str) -> str:
+        ref = ref.strip()
+        if not ref or re.match(r'^(https?:)?//|data:|#', ref):
+            return ref
+
+        m = re.match(r'^(?P<path>[^?#]+)(?P<suffix>[?#].*)?$', ref)
+        if not m:
+            return ref
+
+        path_part = m.group('path').strip()
+        suffix = m.group('suffix') or ''
+
+        try:
+            source_candidate = (source_doc_parent / path_part).resolve()
+            rel_in_assets = source_candidate.relative_to(source_assets_root)
+        except Exception:
+            return ref
+
+        target_candidate = target_assets / rel_in_assets
+        new_ref = os.path.relpath(target_candidate, start=target_doc.parent).replace(os.sep, '/')
+        return new_ref + suffix
+
+    text = re.sub(
+        r'(!\[[^\]]*\]\()([^)]+)(\))',
+        lambda m: f"{m.group(1)}{map_ref(m.group(2))}{m.group(3)}",
+        text,
+    )
+    text = re.sub(
+        r'(<img[^>]+src=["\'])([^"\']+)(["\'])',
+        lambda m: f"{m.group(1)}{map_ref(m.group(2))}{m.group(3)}",
+        text,
+    )
+    return text
+
+
+def merge_gitignore(repo_dir: Path):
+    existing = []
+    p = repo_dir / '.gitignore'
+    if p.exists():
+        existing = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+    merged = []
+    seen = set()
+    for line in existing + GITIGNORE_LINES:
+        if line not in seen:
+            merged.append(line)
+            seen.add(line)
+    p.write_text("\n".join(merged).rstrip("\n") + "\n", encoding='utf-8')
+
+
+def sync_scope(repo_dir: Path, doc: Path, assets: Path, owner: str, repo: str):
+    manifest = load_manifest(owner, repo)
+    previous = manifest.get("managed", {})
+    prev_doc = previous.get("doc_name")
+    prev_assets = previous.get("asset_dir_name")
+
+    if prev_doc and prev_doc != doc.name:
+        safe_remove(repo_dir / prev_doc)
+    if prev_assets and prev_assets != assets.name:
+        safe_remove(repo_dir / prev_assets)
+
+    target_doc = repo_dir / doc.name
+    target_assets = repo_dir / assets.name
+    safe_remove(target_assets)
+    shutil.copytree(assets, target_assets, ignore=shutil.ignore_patterns('.DS_Store'))
+    doc_text = doc.read_text(encoding='utf-8')
+    rewritten_doc = rewrite_markdown_asset_refs(doc_text, doc, assets, target_doc, target_assets)
+    target_doc.write_text(rewritten_doc, encoding='utf-8')
+    merge_gitignore(repo_dir)
+
+    save_manifest(owner, repo, {
+        "owner": owner,
+        "repo": repo,
+        "managed": {
+            "doc_name": doc.name,
+            "asset_dir_name": assets.name,
+        }
+    })
+    return target_doc, target_assets
+
+
+def verify_markdown_assets(repo_dir: Path, doc_path: Path):
+    text = doc_path.read_text(encoding="utf-8")
+    refs = re.findall(r'!\[[^\]]*\]\(([^)]+)\)', text)
+    refs += re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', text)
+    missing = []
+    for ref in refs:
+        ref = ref.strip()
+        if not ref or re.match(r'^(https?:)?//|data:|#', ref):
+            continue
+        path_part = re.match(r'^([^?#]+)', ref)
+        if not path_part:
+            continue
+        candidate = (doc_path.parent / path_part.group(1)).resolve()
+        try:
+            candidate.relative_to(repo_dir.resolve())
+        except Exception:
+            missing.append(ref)
+            continue
+        if not candidate.exists():
+            missing.append(ref)
+    return refs, missing
+
+
+def commit_and_push(repo_dir: Path, token: str, message: str, branch: str = "main"):
+    name = run(["git", "config", "--global", "user.name"], check=False).stdout.strip() or DEFAULT_OWNER
+    email = run(["git", "config", "--global", "user.email"], check=False).stdout.strip() or "895696285@qq.com"
+    git(["config", "user.name", name], repo_dir=repo_dir, token=token)
+    git(["config", "user.email", email], repo_dir=repo_dir, token=token)
+    git(["add", "."], repo_dir=repo_dir, token=token)
+    diff = git(["-c", "core.quotepath=false", "diff", "--cached", "--name-only"], repo_dir=repo_dir, token=token)
+    changed = [line for line in diff.stdout.splitlines() if line.strip()]
+    remote_ref = f"refs/heads/{branch}"
+    if not changed:
+        head_proc = git(["rev-parse", "HEAD"], repo_dir=repo_dir, token=token, check=False)
+        head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+        remote = git(["ls-remote", "origin", remote_ref], repo_dir=repo_dir, token=token, check=False).stdout.strip().split()
+        remote_sha = remote[0] if remote else ""
+        return {
+            "changed": [],
+            "commit_sha": head,
+            "remote_sha": remote_sha,
+            "did_commit": False,
+        }
+    git(["commit", "-m", message], repo_dir=repo_dir, token=token)
+    local_sha = git(["rev-parse", "HEAD"], repo_dir=repo_dir, token=token).stdout.strip()
+    git(["push", "origin", f"HEAD:refs/heads/{branch}"], repo_dir=repo_dir, token=token)
+    remote = git(["ls-remote", "origin", remote_ref], repo_dir=repo_dir, token=token, check=False).stdout.strip().split()
+    remote_sha = remote[0] if remote else ""
+    return {
+        "changed": changed,
+        "commit_sha": local_sha,
+        "remote_sha": remote_sha,
+        "did_commit": True,
+    }
+
+
+def cmd_auth_set(args):
+    token = args.token
+    if not token and not sys.stdin.isatty():
+        token = sys.stdin.read().strip()
+    if not token:
+        token = getpass.getpass("GitHub token: ").strip()
+    if not token:
+        raise RuntimeError("空 token，搞毛啊")
+    keychain_set(token)
+    print("已保存到 macOS Keychain")
+
+
+def cmd_auth_status(args):
+    sources = []
+    if os.environ.get("GITHUB_TOKEN"):
+        sources.append("GITHUB_TOKEN")
+    if keychain_get():
+        sources.append("macOS Keychain")
+    if gh_token():
+        sources.append("gh auth")
+    if not sources:
+        print("未找到可用 token")
+        return
+    print("可用认证来源:")
+    for src in sources:
+        print(f"- {src}")
+
+
+def cmd_auth_delete(args):
+    ok = keychain_delete()
+    print("已删除 Keychain 里的 token" if ok else "Keychain 里没找到 token")
+
+
+def cmd_publish(args):
+    doc = Path(args.doc).expanduser().resolve()
+    assets = Path(args.assets).expanduser().resolve()
+    verify_inputs(doc, assets)
+
+    token, token_source = resolve_token(args.token)
+    owner = detect_owner(token, args.owner)
+    repo = args.repo
+    visibility_private = not args.public
+    repo_action, _repo_meta = ensure_repo(owner, repo, token, private=visibility_private, description=args.description)
+    branch = (_repo_meta or {}).get("default_branch") or "main"
+    repo_dir = ensure_clone(owner, repo, token, branch=branch)
+    target_doc, _target_assets = sync_scope(repo_dir, doc, assets, owner, repo)
+    refs, missing = verify_markdown_assets(repo_dir, target_doc)
+    if missing:
+        raise RuntimeError("Markdown 图片引用失效:\n- " + "\n- ".join(missing))
+    message = args.message or f"Update {repo} requirements and prototype assets"
+    commit_result = commit_and_push(repo_dir, token, message, branch=branch)
+    payload = {
+        "owner": owner,
+        "repo": repo,
+        "repo_url": f"https://github.com/{owner}/{repo}",
+        "repo_action": repo_action,
+        "token_source": token_source,
+        "doc": str(doc),
+        "assets": str(assets),
+        "image_ref_count": len(refs),
+        "missing_image_ref_count": len(missing),
+        "changed_files": commit_result["changed"],
+        "did_commit": commit_result["did_commit"],
+        "commit_sha": commit_result["commit_sha"],
+        "remote_sha": commit_result["remote_sha"],
+        "staging_repo": str(repo_dir),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog=SERVICE_NAME,
+        description="把一个 Markdown 文档 + 一个原型图目录安全同步到 GitHub 仓库。默认只管理你指定的这俩玩意儿，不乱传父目录。",
+    )
+    sub = p.add_subparsers(dest="command")
+
+    auth = sub.add_parser("auth", help="管理 GitHub token")
+    auth_sub = auth.add_subparsers(dest="auth_command")
+
+    auth_set = auth_sub.add_parser("set", help="把 token 保存到 macOS Keychain")
+    auth_set.add_argument("--token", help="直接传 token；不传就安全输入")
+    auth_set.set_defaults(func=cmd_auth_set)
+
+    auth_status = auth_sub.add_parser("status", help="查看当前能用哪些认证来源")
+    auth_status.set_defaults(func=cmd_auth_status)
+
+    auth_delete = auth_sub.add_parser("delete", help="删除 Keychain 里的 token")
+    auth_delete.set_defaults(func=cmd_auth_delete)
+
+    pub = sub.add_parser("publish", help="发布或更新一个文档仓库")
+    pub.add_argument("repo", help="GitHub 仓库名，比如 BD2.0")
+    pub.add_argument("doc", help="Markdown 文档路径")
+    pub.add_argument("assets", help="原型图目录路径")
+    pub.add_argument("--owner", help=f"仓库 owner，默认自动探测，兜底 {DEFAULT_OWNER}")
+    pub.add_argument("--token", help="本次命令使用的 GitHub token")
+    pub.add_argument("--public", action="store_true", help="仓库不存在时，按公开仓库创建；默认私有")
+    pub.add_argument("--description", help="仓库描述")
+    pub.add_argument("--message", help="提交信息")
+    pub.set_defaults(func=cmd_publish)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    if len(sys.argv) > 1 and sys.argv[1] not in {"auth", "publish", "-h", "--help"}:
+        sys.argv.insert(1, "publish")
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 1
+    try:
+        args.func(args)
+        return 0
+    except Exception as e:
+        eprint(f"报错了：{e}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
